@@ -15,7 +15,7 @@ env/
 .vscode/
 .idea/
 
-# Distribution / Packaging
+# PyInstaller distribution / packaging output
 dist/
 build/
 *.spec

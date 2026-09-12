@@ -50,35 +50,54 @@ def get_track_info_gap(font_size):
     return max(6, int(font_size * 0.5))
 
 
+def get_overlay_position_bounds(screen_geom):
+    """Return offset bounds that let the lyric anchor reach every screen edge.
+
+    The overlay is deliberately larger than an individual lyric line.  Positioning
+    the *window* inside the screen therefore leaves the lyrics stranded away from
+    the left and right edges.  These bounds are based on the window's centre, so
+    the visible lyric anchor can travel across the whole selected display even
+    when the overlay itself extends beyond an edge.
+    """
+    return {
+        "min_x_offset": -(screen_geom.width() // 2),
+        "max_x_offset": screen_geom.width() // 2,
+        # A negative Y offset moves the overlay down.  At the minimum, the
+        # centre of the lyric overlay is exactly at the display's bottom edge.
+        "min_y_offset": -(OVERLAY_HEIGHT // 2),
+        "max_y_offset": screen_geom.height() - (OVERLAY_HEIGHT // 2),
+    }
+
+
 def compute_overlay_geometry(settings, screen_geom):
     width = OVERLAY_WIDTH
     height = OVERLAY_HEIGHT
 
-    extra_y = height // 2
-    min_y_offset = -extra_y
-    max_y_offset = screen_geom.height() - height + extra_y
-    y_offset = clamp(settings.get("window_y_offset", 0), min_y_offset, max_y_offset)
+    position_bounds = get_overlay_position_bounds(screen_geom)
+    min_y_offset = position_bounds["min_y_offset"]
+    max_y_offset = position_bounds["max_y_offset"]
+    y_offset = clamp(
+        settings.get("window_y_offset", 0), min_y_offset, max_y_offset
+    )
     base_y = screen_geom.y() + (screen_geom.height() - height)
     y_pos = base_y - y_offset
 
-    max_x_offset = max(0, (screen_geom.width() - width) // 2)
-    x_offset = clamp(settings.get("window_x_offset", 0), -max_x_offset, max_x_offset)
+    min_x_offset = position_bounds["min_x_offset"]
+    max_x_offset = position_bounds["max_x_offset"]
+    x_offset = clamp(
+        settings.get("window_x_offset", 0), min_x_offset, max_x_offset
+    )
 
     center_x = screen_geom.x() + (screen_geom.width() - width) // 2
     x_pos = center_x + x_offset
-
-    min_x = screen_geom.x()
-    max_x = screen_geom.x() + screen_geom.width() - width
-    if max_x < min_x:
-        x_pos = center_x
-    else:
-        x_pos = clamp(x_pos, min_x, max_x)
 
     return {
         "x": x_pos,
         "y": y_pos,
         "width": width,
         "height": height,
+        "min_x_offset": min_x_offset,
+        "max_x_offset": max_x_offset,
         "min_y_offset": min_y_offset,
         "max_y_offset": max_y_offset,
     }
@@ -374,7 +393,10 @@ class SettingsDialog(QDialog):
 
         pos_layout.addLayout(x_layout)
         pos_layout.addWidget(
-            QLabel("<small>Adjust the horizontal position. 0 = center.</small>")
+            QLabel(
+                "<small>Move the lyric anchor anywhere across the selected display. "
+                "0 = center; the transparent overlay may extend past an edge.</small>"
+            )
         )
 
         pos_group.setLayout(pos_layout)
@@ -691,13 +713,14 @@ class SettingsDialog(QDialog):
         overlay_geom = compute_overlay_geometry(self.temp_settings, screen_geom)
         min_y_offset = overlay_geom["min_y_offset"]
         max_y_offset = overlay_geom["max_y_offset"]
-        max_x_offset = max(0, (screen_geom.width() - OVERLAY_WIDTH) // 2)
+        min_x_offset = overlay_geom["min_x_offset"]
+        max_x_offset = overlay_geom["max_x_offset"]
 
         y_value = clamp(
             self.temp_settings.get("window_y_offset", 0), min_y_offset, max_y_offset
         )
         x_value = clamp(
-            self.temp_settings.get("window_x_offset", 0), -max_x_offset, max_x_offset
+            self.temp_settings.get("window_x_offset", 0), min_x_offset, max_x_offset
         )
 
         self.slider_offset_y.blockSignals(True)
@@ -707,8 +730,8 @@ class SettingsDialog(QDialog):
 
         self.slider_offset_y.setRange(min_y_offset, max_y_offset)
         self.spin_offset_y.setRange(min_y_offset, max_y_offset)
-        self.slider_offset_x.setRange(-max_x_offset, max_x_offset)
-        self.spin_offset_x.setRange(-max_x_offset, max_x_offset)
+        self.slider_offset_x.setRange(min_x_offset, max_x_offset)
+        self.spin_offset_x.setRange(min_x_offset, max_x_offset)
 
         self.slider_offset_y.setValue(y_value)
         self.spin_offset_y.setValue(y_value)
