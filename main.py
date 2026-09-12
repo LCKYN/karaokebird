@@ -557,7 +557,10 @@ class TrackInfoWindow(QWidget):
         self.label = MarqueeLabel("")
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setWordWrap(False)
-        self.label.setScrollSpeed(45)
+        # Track information must remain in a fixed position.  MarqueeLabel only
+        # moves overflow text left when scrolling is enabled, which made long
+        # titles visibly shift while short titles stayed centered.
+        self.label.setScrollEnabled(False)
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
