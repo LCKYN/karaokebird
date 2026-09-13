@@ -257,7 +257,6 @@ class OverlayWindow(QWidget):
 
         # Apply initial settings
         self.apply_settings()
-        self.update_hotkey()
 
     def toggle_visibility(self):
         if self.isVisible():
@@ -265,22 +264,6 @@ class OverlayWindow(QWidget):
         else:
             self.show()
         self.visibility_changed.emit(self.isVisible())
-
-    def update_hotkey(self):
-        try:
-            keyboard.unhook_all()
-            hotkey = self.settings.get("toggle_hotkey", "")
-            if hotkey:
-                # Map Qt key names to keyboard library names
-                hotkey = (
-                    hotkey.replace("Meta", "windows")
-                    .replace("Return", "enter")
-                    .replace("PgUp", "page up")
-                    .replace("PgDown", "page down")
-                )
-                keyboard.add_hotkey(hotkey, self.visibility_toggled.emit)
-        except Exception as e:
-            print(f"Error setting hotkey: {e}")
 
     def apply_settings(self, settings_override=None):
         # Update local settings ref
@@ -372,9 +355,6 @@ class OverlayWindow(QWidget):
                 "Waiting for music..." if not self.lyrics_data else "Lyrics loaded!"
             )
             self.system_message_time = time.time()
-
-        if settings_override is None:
-            self.update_hotkey()
 
     def set_track_info(self, title, artist):
         self.current_title = title
@@ -538,13 +518,18 @@ class OverlayWindow(QWidget):
 
 
 class TrackInfoWindow(QWidget):
+    visibility_toggled = pyqtSignal()
+
     def __init__(self, settings_manager):
         super().__init__()
+        self.visibility_toggled.connect(self.toggle_visibility)
         self.settings_manager = settings_manager
         self.settings = self.settings_manager.settings
         self.current_title = ""
         self.current_artist = ""
-        self.overlay_visible = True
+        # Manual show/hide state, independent of the lyric overlay's own
+        # visibility. Toggled via its own hotkey/tray action.
+        self.manually_hidden = False
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -582,21 +567,21 @@ class TrackInfoWindow(QWidget):
             text = self.current_title or ""
         self.label.setText(text)
 
-    def update_visibility(self, overlay_visible):
-        self.overlay_visible = overlay_visible
-        if overlay_visible and self.settings.get("track_info_enabled", False):
+    def toggle_visibility(self):
+        self.manually_hidden = not self.manually_hidden
+        self.update_visibility()
+
+    def update_visibility(self):
+        if self.settings.get("track_info_enabled", False) and not self.manually_hidden:
             self.show()
         else:
             self.hide()
 
-    def apply_settings(self, settings_override=None, overlay_visible=None):
+    def apply_settings(self, settings_override=None):
         if settings_override:
             self.settings = settings_override
         else:
             self.settings = self.settings_manager.settings
-
-        if overlay_visible is not None:
-            self.overlay_visible = overlay_visible
 
         font_family = self.settings.get("font_family", "Century Gothic")
         font_size = self.settings.get("font_size_normal", 14)
@@ -637,7 +622,44 @@ class TrackInfoWindow(QWidget):
 
         self.setGeometry(x_pos, y_pos, width, height)
         self.update_text()
-        self.update_visibility(self.overlay_visible)
+        self.update_visibility()
+
+
+def _normalize_hotkey(hotkey):
+    # Map Qt key names to keyboard library names
+    return (
+        hotkey.replace("Meta", "windows")
+        .replace("Return", "enter")
+        .replace("PgUp", "page up")
+        .replace("PgDown", "page down")
+    )
+
+
+def register_hotkeys(window, track_info_window=None):
+    """(Re)binds all global hotkeys in one place.
+
+    keyboard.unhook_all() clears every previously registered hotkey, so both
+    the lyrics-toggle and track-info-toggle hotkeys must be (re)registered
+    together whenever either one changes.
+    """
+    try:
+        keyboard.unhook_all()
+
+        overlay_hotkey = window.settings.get("toggle_hotkey", "")
+        if overlay_hotkey:
+            keyboard.add_hotkey(
+                _normalize_hotkey(overlay_hotkey), window.visibility_toggled.emit
+            )
+
+        if track_info_window:
+            track_hotkey = track_info_window.settings.get("track_info_hotkey", "")
+            if track_hotkey:
+                keyboard.add_hotkey(
+                    _normalize_hotkey(track_hotkey),
+                    track_info_window.visibility_toggled.emit,
+                )
+    except Exception as e:
+        print(f"Error setting hotkeys: {e}")
 
 
 # --- Main Entry ---
@@ -690,6 +712,12 @@ def create_tray_icon(app, window, settings_manager, track_info_window=None):
     action_toggle.triggered.connect(window.toggle_visibility)
     menu.addAction(action_toggle)
 
+    # Toggle Track Info Visibility (independent of the lyrics overlay)
+    if track_info_window:
+        action_toggle_track_info = QAction("Show/Hide Track Info", app)
+        action_toggle_track_info.triggered.connect(track_info_window.toggle_visibility)
+        menu.addAction(action_toggle_track_info)
+
     # Settings Action
     action_settings = QAction("Settings...", app)
 
@@ -703,10 +731,7 @@ def create_tray_icon(app, window, settings_manager, track_info_window=None):
             original_update_preview()
             window.apply_settings(settings_override=dlg.temp_settings)
             if track_info_window:
-                track_info_window.apply_settings(
-                    settings_override=dlg.temp_settings,
-                    overlay_visible=window.isVisible(),
-                )
+                track_info_window.apply_settings(settings_override=dlg.temp_settings)
 
         dlg.update_preview = live_update_proxy
 
@@ -714,7 +739,8 @@ def create_tray_icon(app, window, settings_manager, track_info_window=None):
         def apply_saved_settings():
             window.apply_settings()
             if track_info_window:
-                track_info_window.apply_settings(overlay_visible=window.isVisible())
+                track_info_window.apply_settings()
+            register_hotkeys(window, track_info_window)
 
         dlg.settings_changed.connect(lambda s: apply_saved_settings())
 
@@ -722,7 +748,8 @@ def create_tray_icon(app, window, settings_manager, track_info_window=None):
             # If Cancelled, revert to original settings
             window.apply_settings()
             if track_info_window:
-                track_info_window.apply_settings(overlay_visible=window.isVisible())
+                track_info_window.apply_settings()
+            register_hotkeys(window, track_info_window)
 
     action_settings.triggered.connect(show_settings)
     menu.addAction(action_settings)
@@ -759,11 +786,11 @@ def main():
     window.show()
 
     track_info_window = TrackInfoWindow(settings_manager)
-    window.visibility_changed.connect(track_info_window.update_visibility)
-    track_info_window.update_visibility(window.isVisible())
 
     # Create tray icon
     tray = create_tray_icon(app, window, settings_manager, track_info_window)
+
+    register_hotkeys(window, track_info_window)
 
     reader = SpotifyReader()
 

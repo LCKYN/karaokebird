@@ -125,6 +125,7 @@ DEFAULT_SETTINGS = {
     "track_info_enabled": False,
     "track_info_x_offset": 0,
     "track_info_y_offset": 0,
+    "track_info_hotkey": "",
 }
 
 
@@ -559,12 +560,29 @@ class SettingsDialog(QDialog):
         current_hotkey = self.temp_settings.get("toggle_hotkey", "")
         if current_hotkey:
             self.hotkey_edit.setKeySequence(QKeySequence(current_hotkey))
-        self.hotkey_edit.keySequenceChanged.connect(self.update_hotkey)
+        self.hotkey_edit.keySequenceChanged.connect(
+            lambda seq: self.update_hotkey("toggle_hotkey", seq)
+        )
 
-        ctrl_layout.addRow("Toggle Overlay Hotkey:", self.hotkey_edit)
+        ctrl_layout.addRow("Toggle Lyrics Hotkey:", self.hotkey_edit)
         ctrl_layout.addRow(
             QLabel(
-                "<small>Click and press a key combination (e.g., Ctrl+L) to hide/show.</small>"
+                "<small>Click and press a key combination (e.g., Ctrl+L) to hide/show the lyrics.</small>"
+            )
+        )
+
+        self.track_hotkey_edit = QKeySequenceEdit()
+        current_track_hotkey = self.temp_settings.get("track_info_hotkey", "")
+        if current_track_hotkey:
+            self.track_hotkey_edit.setKeySequence(QKeySequence(current_track_hotkey))
+        self.track_hotkey_edit.keySequenceChanged.connect(
+            lambda seq: self.update_hotkey("track_info_hotkey", seq)
+        )
+
+        ctrl_layout.addRow("Toggle Track Info Hotkey:", self.track_hotkey_edit)
+        ctrl_layout.addRow(
+            QLabel(
+                "<small>Hide/show the song and artist independently of the lyrics.</small>"
             )
         )
 
@@ -627,9 +645,9 @@ class SettingsDialog(QDialog):
         self.temp_settings[key] = value
         self.update_preview()
 
-    def update_hotkey(self, sequence):
+    def update_hotkey(self, key, sequence):
         hotkey_str = sequence.toString(QKeySequence.SequenceFormat.PortableText)
-        self.temp_settings["toggle_hotkey"] = hotkey_str
+        self.temp_settings[key] = hotkey_str
 
     def update_font(self, font):
         self.temp_settings["font_family"] = font.family()
@@ -691,6 +709,8 @@ class SettingsDialog(QDialog):
         self.spin_sync.setValue(self.temp_settings.get("sync_offset_ms", 0) / 1000.0)
         hotkey = self.temp_settings.get("toggle_hotkey", "")
         self.hotkey_edit.setKeySequence(QKeySequence(hotkey))
+        track_hotkey = self.temp_settings.get("track_info_hotkey", "")
+        self.track_hotkey_edit.setKeySequence(QKeySequence(track_hotkey))
 
         self.update_preview()
 
