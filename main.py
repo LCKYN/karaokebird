@@ -1,8 +1,10 @@
 import asyncio
+import logging
 import os
 import sys
 import time
 import webbrowser
+from logging.handlers import RotatingFileHandler
 
 import keyboard
 import qasync
@@ -30,16 +32,29 @@ from PyQt6.QtWidgets import (
 )
 
 from settings_ui import (
+    SETTINGS_FILE,
     SettingsDialog,
     SettingsManager,
     compute_overlay_geometry,
-    get_track_info_gap,
-    get_track_info_height,
-    get_track_info_width,
+    compute_track_info_geometry,
+    get_app_data_dir,
 )
 from ui_components import MarqueeLabel, StrokedLabel
 
 # --- Backend Logic ---
+
+
+def setup_logging():
+    log_path = os.path.join(get_app_data_dir(), "karaokebird.log")
+    handler = RotatingFileHandler(
+        log_path, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(handler)
 
 
 class SpotifyReader(QObject):
@@ -50,12 +65,24 @@ class SpotifyReader(QObject):
     lyrics_found = pyqtSignal(list)  # list of (time_ms, text)
     status_message = pyqtSignal(str)
 
+    ACTIVE_POLL_INTERVAL = 0.2  # 5Hz while a session is actively playing
+    IDLE_POLL_INTERVAL = 1.0  # back off when there's nothing to track
+    IDLE_AFTER_SECONDS = 5  # how long paused/inactive before backing off
+
     def __init__(self):
         super().__init__()
         self.manager = None
         self.current_session = None
         self.current_track_id = None
         self.lyrics_cache = {}
+        self.last_active_time = time.time()
+
+    def get_poll_interval(self):
+        if not self.current_session:
+            return self.IDLE_POLL_INTERVAL
+        if time.time() - self.last_active_time > self.IDLE_AFTER_SECONDS:
+            return self.IDLE_POLL_INTERVAL
+        return self.ACTIVE_POLL_INTERVAL
 
     async def setup(self):
         try:
@@ -101,6 +128,8 @@ class SpotifyReader(QObject):
                     playback_info.playback_status
                     == wmc.GlobalSystemMediaTransportControlsSessionPlaybackStatus.PLAYING
                 )
+                if is_playing:
+                    self.last_active_time = sys_now_ms / 1000.0
 
                 # Apply correction for the time passed since the media player last updated
                 # its position. Only correct when actually playing — when paused, the raw
@@ -115,8 +144,8 @@ class SpotifyReader(QObject):
                 self.playback_sync.emit(
                     is_playing, int(position), int(duration), capture_time
                 )
-        except Exception as e:
-            print(f"Error polling SMTC: {e}")
+        except Exception:
+            logging.exception("Error polling SMTC")
 
         # Get Metadata (Title/Artist)
         try:
@@ -132,14 +161,18 @@ class SpotifyReader(QObject):
                 self.track_changed.emit(title, artist)
 
                 # Fetch lyrics in background
-                asyncio.create_task(self.fetch_lyrics(title, artist))
+                asyncio.create_task(self.fetch_lyrics(track_id, title, artist))
 
-        except Exception as e:
-            print(f"Error reading metadata: {e}")
+        except Exception:
+            logging.exception("Error reading metadata")
 
-    async def fetch_lyrics(self, title, artist):
+    async def fetch_lyrics(self, track_id, title, artist):
+        if track_id in self.lyrics_cache:
+            self.lyrics_found.emit(self.lyrics_cache[track_id])
+            return
+
         search_term = f"{title} {artist}"
-        print(f"Searching lyrics for: {search_term}")
+        logging.info(f"Searching lyrics for: {search_term}")
 
         try:
             # syncedlyrics provides LRC string. We run it in a thread to avoid blocking GUI/Async loop
@@ -147,12 +180,14 @@ class SpotifyReader(QObject):
 
             if lrc_str:
                 parsed = self.parse_lrc(lrc_str)
+                self.lyrics_cache[track_id] = parsed
                 self.lyrics_found.emit(parsed)
             else:
-                self.lyrics_found.emit([])  # No lyrics found
+                self.lyrics_cache[track_id] = []  # No lyrics found
+                self.lyrics_found.emit([])
                 self.status_message.emit("No synced lyrics found.")
-        except Exception as e:
-            print(f"Lyrics fetch error: {e}")
+        except Exception:
+            logging.exception("Lyrics fetch error")
             self.lyrics_found.emit([])
 
     def parse_lrc(self, lrc_string):
@@ -198,6 +233,15 @@ class SpotifyReader(QObject):
 # --- Frontend GUI ---
 
 
+# Sentinel indices used in place of a real lyrics_data index to request a
+# system message on the current-line label (see OverlayWindow.get_line_text).
+NOW_PLAYING_INDEX = -1
+LYRICS_LOADED_INDEX = -2
+# Guaranteed not to match any real or system-message index, used to force
+# update_frame() to recompute and redisplay the active line.
+FORCE_REFRESH_INDEX = -999
+
+
 def get_target_screen(settings):
     screens = QApplication.screens()
     screen_index = settings.get("screen_index", 0)
@@ -237,9 +281,22 @@ class OverlayWindow(QWidget):
         self.curr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.curr_label.setWordWrap(False)
 
+        # Shadow effect (curr_label is never recreated, so this is set once)
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(10)
+        shadow.setColor(QColor(0, 0, 0, 200))
+        shadow.setOffset(2, 2)
+        self.curr_label.setGraphicsEffect(shadow)
+
+        # Tracks the settings that last triggered a label rebuild, so
+        # apply_settings only rebuilds when one of them actually changed.
+        self._last_num_history = None
+        self._last_num_future = None
+        self._last_font_family = None
+
         # Internal State
         self.lyrics_data = []
-        self.current_lyric_index = -1
+        self.current_lyric_index = NOW_PLAYING_INDEX
         self.current_title = ""
         self.current_artist = ""
 
@@ -266,24 +323,31 @@ class OverlayWindow(QWidget):
         self.visibility_changed.emit(self.isVisible())
 
     def apply_settings(self, settings_override=None):
-        # Update local settings ref
+        """Full settings application: rebuilds labels if needed, then
+        applies geometry/position and re-styles them. Use this on Save/Cancel;
+        use apply_geometry directly for cheap live-preview ticks."""
         if settings_override:
             self.settings = settings_override
         else:
             self.settings = self.settings_manager.settings
 
-        # 1. Geometry / Position
-        screen = get_target_screen(self.settings)
-        screen_geom = screen.geometry()
-        overlay_geom = compute_overlay_geometry(self.settings, screen_geom)
-        self.setGeometry(
-            overlay_geom["x"],
-            overlay_geom["y"],
-            overlay_geom["width"],
-            overlay_geom["height"],
-        )
+        num_history = self.settings.get("num_history_lines", 1)
+        num_future = self.settings.get("num_future_lines", 1)
+        font_family = self.settings["font_family"]
 
-        # 2. Rebuild Labels
+        if (
+            num_history != self._last_num_history
+            or num_future != self._last_num_future
+            or font_family != self._last_font_family
+        ):
+            self.rebuild_labels(self.settings)
+
+        self.apply_geometry(self.settings)
+
+    def rebuild_labels(self, settings):
+        """Delete/recreate the previous/next context labels. Only needed
+        when the line counts or font family change — expensive because it
+        tears down and rebuilds widgets, unlike apply_geometry."""
         # Clear existing widgets from layout
         while self.main_layout.count():
             child = self.main_layout.takeAt(0)
@@ -296,59 +360,65 @@ class OverlayWindow(QWidget):
         self.prev_labels = []
         self.next_labels = []
 
-        num_history = self.settings.get("num_history_lines", 1)
-        num_future = self.settings.get("num_future_lines", 1)
-        font_family = self.settings["font_family"]
+        num_history = settings.get("num_history_lines", 1)
+        num_future = settings.get("num_future_lines", 1)
 
-        # --- Previous Lines ---
         for _ in range(num_history):
             l = StrokedLabel("")
             l.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            l.setFont(QFont(font_family, self.settings["font_size_normal"]))
-            l.setStyleSheet(f"color: {self.settings['normal_color']};")
-            l.setStrokeColor(self.settings.get("stroke_color", "#000000"))
-            l.setStrokeEnabled(self.settings.get("stroke_enabled_context", True))
-            l.enable_animation = self.settings.get("enable_animations", True)
-            l.animation_type = self.settings.get("animation_type", "fade")
             self.prev_labels.append(l)
             self.main_layout.addWidget(l)
 
-        # --- Current Line ---
-        self.curr_label.setFont(
-            QFont(font_family, self.settings["font_size_highlight"], QFont.Weight.Bold)
-        )
-        self.curr_label.setStyleSheet(f"color: {self.settings['highlight_color']};")
-        self.curr_label.setStrokeColor(self.settings.get("stroke_color", "#000000"))
-        self.curr_label.setStrokeEnabled(
-            self.settings.get("stroke_enabled_highlight", True)
-        )
-        self.curr_label.enable_animation = self.settings.get("enable_animations", True)
-        self.curr_label.animation_type = self.settings.get("animation_type", "fade")
-
-        # Shadow effect
-        shadow = QGraphicsDropShadowEffect()
-        shadow.setBlurRadius(10)
-        shadow.setColor(QColor(0, 0, 0, 200))
-        shadow.setOffset(2, 2)
-        self.curr_label.setGraphicsEffect(shadow)
-
         self.main_layout.addWidget(self.curr_label)
 
-        # --- Next Lines ---
         for _ in range(num_future):
             l = StrokedLabel("")
             l.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            l.setFont(QFont(font_family, self.settings["font_size_normal"]))
-            l.setStyleSheet(f"color: {self.settings['normal_color']};")
-            l.setStrokeColor(self.settings.get("stroke_color", "#000000"))
-            l.setStrokeEnabled(self.settings.get("stroke_enabled_context", True))
-            l.enable_animation = self.settings.get("enable_animations", True)
-            l.animation_type = self.settings.get("animation_type", "fade")
             self.next_labels.append(l)
             self.main_layout.addWidget(l)
 
+        self._last_num_history = num_history
+        self._last_num_future = num_future
+        self._last_font_family = settings["font_family"]
+
+    def apply_geometry(self, settings):
+        """Cheap path: recompute geometry and re-style existing labels
+        (font/color/stroke) without deleting/recreating them. Safe to call
+        on every live-preview tick."""
+        self.settings = settings
+        screen = get_target_screen(settings)
+        screen_geom = screen.geometry()
+        overlay_geom = compute_overlay_geometry(settings, screen_geom)
+        self.setGeometry(
+            overlay_geom["x"],
+            overlay_geom["y"],
+            overlay_geom["width"],
+            overlay_geom["height"],
+        )
+
+        font_family = settings["font_family"]
+
+        for l in self.prev_labels + self.next_labels:
+            l.setFont(QFont(font_family, settings["font_size_normal"]))
+            l.setStyleSheet(f"color: {settings['normal_color']};")
+            l.setStrokeColor(settings.get("stroke_color", "#000000"))
+            l.setStrokeEnabled(settings.get("stroke_enabled_context", True))
+            l.enable_animation = settings.get("enable_animations", True)
+            l.animation_type = settings.get("animation_type", "fade")
+
+        self.curr_label.setFont(
+            QFont(font_family, settings["font_size_highlight"], QFont.Weight.Bold)
+        )
+        self.curr_label.setStyleSheet(f"color: {settings['highlight_color']};")
+        self.curr_label.setStrokeColor(settings.get("stroke_color", "#000000"))
+        self.curr_label.setStrokeEnabled(
+            settings.get("stroke_enabled_highlight", True)
+        )
+        self.curr_label.enable_animation = settings.get("enable_animations", True)
+        self.curr_label.animation_type = settings.get("animation_type", "fade")
+
         # Force refresh of text content
-        if self.current_lyric_index != -1:
+        if self.current_lyric_index != NOW_PLAYING_INDEX:
             self.update_display(self.current_lyric_index)
         elif not self.lyrics_data:
             self.curr_label.setText(
@@ -361,8 +431,8 @@ class OverlayWindow(QWidget):
         self.current_artist = artist
         # Reset lyrics and show title immediately
         self.lyrics_data = []
-        self.current_lyric_index = -1
-        self.update_display(-1)
+        self.current_lyric_index = NOW_PLAYING_INDEX
+        self.update_display(NOW_PLAYING_INDEX)
 
     def update_status(self, msg):
         # Since we removed the status label to clean up the look, we might just print to console
@@ -388,7 +458,7 @@ class OverlayWindow(QWidget):
             # Let update_frame determine the correct starting point
             # based on current playback position. We force an update by
             # setting current index to an impossible value.
-            self.current_lyric_index = -999
+            self.current_lyric_index = FORCE_REFRESH_INDEX
             self.update_frame()
 
     def on_playback_sync(self, is_playing, position, duration, capture_time):
@@ -443,7 +513,7 @@ class OverlayWindow(QWidget):
 
         # Find current line
         # We look for the last line that has a start time <= current_time
-        active_index = -1
+        active_index = NOW_PLAYING_INDEX
         for i, line in enumerate(self.lyrics_data):
             if line["time"] <= current_time:
                 active_index = i
@@ -471,7 +541,7 @@ class OverlayWindow(QWidget):
             return ""
 
         # Main label (index < 0) system messages
-        if index == -1:
+        if index == NOW_PLAYING_INDEX:
             if self.settings.get("track_info_enabled", False):
                 return ""
             if not self.current_title:
@@ -479,7 +549,7 @@ class OverlayWindow(QWidget):
             if self.current_artist:
                 return f"Now Playing: {self.current_title} — {self.current_artist}"
             return f"Now Playing: {self.current_title}"
-        elif index == -2:
+        elif index == LYRICS_LOADED_INDEX:
             return "Lyrics loaded!"
         return ""
 
@@ -519,6 +589,7 @@ class OverlayWindow(QWidget):
 
 class TrackInfoWindow(QWidget):
     visibility_toggled = pyqtSignal()
+    visibility_changed = pyqtSignal(bool)
 
     def __init__(self, settings_manager):
         super().__init__()
@@ -576,8 +647,13 @@ class TrackInfoWindow(QWidget):
             self.show()
         else:
             self.hide()
+        self.visibility_changed.emit(self.isVisible())
 
     def apply_settings(self, settings_override=None):
+        """Full settings application: re-styles the label (font/color/
+        stroke) and applies geometry. Use this on Save/Cancel; use
+        apply_geometry directly for cheap live-preview ticks where only
+        position offsets may have changed."""
         if settings_override:
             self.settings = settings_override
         else:
@@ -590,37 +666,15 @@ class TrackInfoWindow(QWidget):
         self.label.setStrokeColor(self.settings.get("stroke_color", "#000000"))
         self.label.setStrokeEnabled(self.settings.get("stroke_enabled_context", True))
 
-        screen = get_target_screen(self.settings)
+        self.apply_geometry(self.settings)
+
+    def apply_geometry(self, settings):
+        self.settings = settings
+        screen = get_target_screen(settings)
         screen_geom = screen.geometry()
-        overlay_geom = compute_overlay_geometry(self.settings, screen_geom)
+        geom = compute_track_info_geometry(settings, screen_geom)
 
-        width = get_track_info_width(screen_geom.width())
-        height = get_track_info_height(font_size)
-        gap = get_track_info_gap(font_size)
-
-        base_x = overlay_geom["x"] + (overlay_geom["width"] - width) // 2
-        base_y = overlay_geom["y"] + (overlay_geom["height"] // 2) - height - gap
-
-        min_x = screen_geom.x()
-        max_x = screen_geom.x() + screen_geom.width() - width
-        min_y = screen_geom.y()
-        max_y = screen_geom.y() + screen_geom.height() - height
-
-        x_offset = self.settings.get("track_info_x_offset", 0)
-        y_offset = self.settings.get("track_info_y_offset", 0)
-
-        min_x_offset = min_x - base_x
-        max_x_offset = max_x - base_x
-        min_y_offset = min_y - base_y
-        max_y_offset = max_y - base_y
-
-        x_offset = max(min_x_offset, min(x_offset, max_x_offset))
-        y_offset = max(min_y_offset, min(y_offset, max_y_offset))
-
-        x_pos = base_x + x_offset
-        y_pos = base_y + y_offset
-
-        self.setGeometry(x_pos, y_pos, width, height)
+        self.setGeometry(geom["x"], geom["y"], geom["width"], geom["height"])
         self.update_text()
         self.update_visibility()
 
@@ -658,8 +712,8 @@ def register_hotkeys(window, track_info_window=None):
                     _normalize_hotkey(track_hotkey),
                     track_info_window.visibility_toggled.emit,
                 )
-    except Exception as e:
-        print(f"Error setting hotkeys: {e}")
+    except Exception:
+        logging.exception("Error setting hotkeys")
 
 
 # --- Main Entry ---
@@ -669,7 +723,7 @@ async def main_loop(reader):
     await reader.setup()
     while True:
         await reader.poll_status()
-        await asyncio.sleep(0.2)  # Higher poll frequency (5Hz)
+        await asyncio.sleep(reader.get_poll_interval())
 
 
 def resource_path(relative_path):
@@ -709,13 +763,21 @@ def create_tray_icon(app, window, settings_manager, track_info_window=None):
 
     # Toggle Visibility
     action_toggle = QAction("Show/Hide Overlay", app)
+    action_toggle.setCheckable(True)
+    action_toggle.setChecked(window.isVisible())
     action_toggle.triggered.connect(window.toggle_visibility)
+    window.visibility_changed.connect(action_toggle.setChecked)
     menu.addAction(action_toggle)
 
     # Toggle Track Info Visibility (independent of the lyrics overlay)
     if track_info_window:
         action_toggle_track_info = QAction("Show/Hide Track Info", app)
+        action_toggle_track_info.setCheckable(True)
+        action_toggle_track_info.setChecked(track_info_window.isVisible())
         action_toggle_track_info.triggered.connect(track_info_window.toggle_visibility)
+        track_info_window.visibility_changed.connect(
+            action_toggle_track_info.setChecked
+        )
         menu.addAction(action_toggle_track_info)
 
     # Settings Action
@@ -729,9 +791,9 @@ def create_tray_icon(app, window, settings_manager, track_info_window=None):
 
         def live_update_proxy():
             original_update_preview()
-            window.apply_settings(settings_override=dlg.temp_settings)
+            window.apply_geometry(dlg.temp_settings)
             if track_info_window:
-                track_info_window.apply_settings(settings_override=dlg.temp_settings)
+                track_info_window.apply_geometry(dlg.temp_settings)
 
         dlg.update_preview = live_update_proxy
 
@@ -774,6 +836,11 @@ def create_tray_icon(app, window, settings_manager, track_info_window=None):
 
 
 def main():
+    setup_logging()
+    logging.info("Starting KaraokeBird")
+
+    is_first_run = not os.path.exists(SETTINGS_FILE)
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)  # Keep running for tray
 
@@ -789,6 +856,15 @@ def main():
 
     # Create tray icon
     tray = create_tray_icon(app, window, settings_manager, track_info_window)
+
+    if is_first_run:
+        tray.showMessage(
+            "KaraokeBird is running",
+            "Look for the bird icon in the system tray — right-click it to "
+            "open Settings and position the lyrics overlay.",
+            QSystemTrayIcon.MessageIcon.Information,
+            8000,
+        )
 
     register_hotkeys(window, track_info_window)
 

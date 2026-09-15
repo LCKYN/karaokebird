@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -28,7 +29,20 @@ from PyQt6.QtWidgets import (
 
 from ui_components import StrokedLabel
 
-SETTINGS_FILE = "settings.json"
+
+def get_app_data_dir():
+    """Directory for persisted app state (settings, logs), outside the CWD.
+
+    PyInstaller builds are commonly launched from arbitrary/read-only
+    directories, so writing next to the executable isn't reliable.
+    """
+    base = os.getenv("APPDATA") or os.getcwd()
+    app_dir = os.path.join(base, "KaraokeBird")
+    os.makedirs(app_dir, exist_ok=True)
+    return app_dir
+
+
+SETTINGS_FILE = os.path.join(get_app_data_dir(), "settings.json")
 
 OVERLAY_WIDTH = 1200
 OVERLAY_HEIGHT = 400
@@ -36,6 +50,14 @@ OVERLAY_HEIGHT = 400
 
 def clamp(value, min_value, max_value):
     return max(min_value, min(value, max_value))
+
+
+def color_button_style(color):
+    """Swatch style with a visible border so light/white colors don't
+    disappear against the dialog background."""
+    return (
+        f"background-color: {color}; border: 1px solid #888888; border-radius: 4px;"
+    )
 
 
 def get_track_info_height(font_size):
@@ -103,6 +125,41 @@ def compute_overlay_geometry(settings, screen_geom):
     }
 
 
+def compute_track_info_geometry(settings, screen_geom):
+    overlay_geom = compute_overlay_geometry(settings, screen_geom)
+
+    font_size = settings.get("font_size_normal", 14)
+    width = get_track_info_width(screen_geom.width())
+    height = get_track_info_height(font_size)
+    gap = get_track_info_gap(font_size)
+
+    base_x = overlay_geom["x"] + (overlay_geom["width"] - width) // 2
+    base_y = overlay_geom["y"] + (overlay_geom["height"] // 2) - height - gap
+
+    min_x_offset = screen_geom.x() - base_x
+    max_x_offset = screen_geom.x() + screen_geom.width() - width - base_x
+    min_y_offset = screen_geom.y() - base_y
+    max_y_offset = screen_geom.y() + screen_geom.height() - height - base_y
+
+    x_offset = clamp(
+        settings.get("track_info_x_offset", 0), min_x_offset, max_x_offset
+    )
+    y_offset = clamp(
+        settings.get("track_info_y_offset", 0), min_y_offset, max_y_offset
+    )
+
+    return {
+        "x": base_x + x_offset,
+        "y": base_y + y_offset,
+        "width": width,
+        "height": height,
+        "min_x_offset": min_x_offset,
+        "max_x_offset": max_x_offset,
+        "min_y_offset": min_y_offset,
+        "max_y_offset": max_y_offset,
+    }
+
+
 DEFAULT_SETTINGS = {
     "highlight_color": "#ffff00",
     "stroke_color": "#000000",
@@ -140,15 +197,15 @@ class SettingsManager:
                 with open(SETTINGS_FILE, "r") as f:
                     data = json.load(f)
                     self.settings.update(data)
-            except Exception as e:
-                print(f"Error loading settings: {e}")
+            except Exception:
+                logging.exception("Error loading settings")
 
     def save(self):
         try:
             with open(SETTINGS_FILE, "w") as f:
                 json.dump(self.settings, f, indent=4)
-        except Exception as e:
-            print(f"Error saving settings: {e}")
+        except Exception:
+            logging.exception("Error saving settings")
 
     def get(self, key):
         return self.settings.get(key, DEFAULT_SETTINGS.get(key))
@@ -263,7 +320,7 @@ class SettingsDialog(QDialog):
         self.btn_color_high = QPushButton("Choose...")
         self.btn_color_high.setFixedWidth(100)
         self.btn_color_high.setStyleSheet(
-            f"background-color: {self.temp_settings['highlight_color']}"
+            color_button_style(self.temp_settings["highlight_color"])
         )
         self.btn_color_high.clicked.connect(
             lambda: self.pick_color("highlight_color", self.btn_color_high)
@@ -273,7 +330,7 @@ class SettingsDialog(QDialog):
         self.btn_color_norm = QPushButton("Choose...")
         self.btn_color_norm.setFixedWidth(100)
         self.btn_color_norm.setStyleSheet(
-            f"background-color: {self.temp_settings['normal_color']}"
+            color_button_style(self.temp_settings["normal_color"])
         )
         self.btn_color_norm.clicked.connect(
             lambda: self.pick_color("normal_color", self.btn_color_norm)
@@ -283,7 +340,7 @@ class SettingsDialog(QDialog):
         self.btn_color_stroke = QPushButton("Choose...")
         self.btn_color_stroke.setFixedWidth(100)
         self.btn_color_stroke.setStyleSheet(
-            f"background-color: {self.temp_settings.get('stroke_color', '#000000')}"
+            color_button_style(self.temp_settings.get("stroke_color", "#000000"))
         )
         self.btn_color_stroke.clicked.connect(
             lambda: self.pick_color("stroke_color", self.btn_color_stroke)
@@ -586,6 +643,10 @@ class SettingsDialog(QDialog):
             )
         )
 
+        self.hotkey_warning_label = QLabel("")
+        self.hotkey_warning_label.setStyleSheet("color: #ff5555;")
+        ctrl_layout.addRow(self.hotkey_warning_label)
+
         ctrl_group.setLayout(ctrl_layout)
         layout.addWidget(ctrl_group)
 
@@ -648,6 +709,18 @@ class SettingsDialog(QDialog):
     def update_hotkey(self, key, sequence):
         hotkey_str = sequence.toString(QKeySequence.SequenceFormat.PortableText)
         self.temp_settings[key] = hotkey_str
+        self.check_hotkey_conflict()
+
+    def check_hotkey_conflict(self):
+        toggle_hotkey = self.temp_settings.get("toggle_hotkey", "")
+        track_hotkey = self.temp_settings.get("track_info_hotkey", "")
+        if toggle_hotkey and toggle_hotkey == track_hotkey:
+            self.hotkey_warning_label.setText(
+                "<small>Both hotkeys are set to the same combination — only "
+                "one action will trigger.</small>"
+            )
+        else:
+            self.hotkey_warning_label.setText("")
 
     def update_font(self, font):
         self.temp_settings["font_family"] = font.family()
@@ -660,7 +733,7 @@ class SettingsDialog(QDialog):
         if color.isValid():
             hex_color = color.name()
             self.temp_settings[key] = hex_color
-            button.setStyleSheet(f"background-color: {hex_color}")
+            button.setStyleSheet(color_button_style(hex_color))
             self.update_preview()
 
     def reset_defaults(self):
@@ -671,13 +744,13 @@ class SettingsDialog(QDialog):
         self.spin_size_high.setValue(self.temp_settings["font_size_highlight"])
         self.spin_size_norm.setValue(self.temp_settings["font_size_normal"])
         self.btn_color_high.setStyleSheet(
-            f"background-color: {self.temp_settings['highlight_color']}"
+            color_button_style(self.temp_settings["highlight_color"])
         )
         self.btn_color_stroke.setStyleSheet(
-            f"background-color: {self.temp_settings['stroke_color']}"
+            color_button_style(self.temp_settings["stroke_color"])
         )
         self.btn_color_norm.setStyleSheet(
-            f"background-color: {self.temp_settings['normal_color']}"
+            color_button_style(self.temp_settings["normal_color"])
         )
         self.check_anim.setChecked(self.temp_settings.get("enable_animations", True))
         self.combo_anim_type.setCurrentText(
@@ -711,6 +784,7 @@ class SettingsDialog(QDialog):
         self.hotkey_edit.setKeySequence(QKeySequence(hotkey))
         track_hotkey = self.temp_settings.get("track_info_hotkey", "")
         self.track_hotkey_edit.setKeySequence(QKeySequence(track_hotkey))
+        self.check_hotkey_conflict()
 
         self.update_preview()
 
@@ -766,20 +840,11 @@ class SettingsDialog(QDialog):
         self.temp_settings["window_y_offset"] = y_value
         self.temp_settings["window_x_offset"] = x_value
 
-        font_size = self.temp_settings.get("font_size_normal", 14)
-        track_height = get_track_info_height(font_size)
-        track_width = get_track_info_width(screen_geom.width())
-        track_gap = get_track_info_gap(font_size)
-
-        base_x = overlay_geom["x"] + (overlay_geom["width"] - track_width) // 2
-        base_y = (
-            overlay_geom["y"] + (overlay_geom["height"] // 2) - track_height - track_gap
-        )
-
-        min_track_x = screen_geom.x() - base_x
-        max_track_x = screen_geom.x() + screen_geom.width() - track_width - base_x
-        min_track_y = screen_geom.y() - base_y
-        max_track_y = screen_geom.y() + screen_geom.height() - track_height - base_y
+        track_geom = compute_track_info_geometry(self.temp_settings, screen_geom)
+        min_track_x = track_geom["min_x_offset"]
+        max_track_x = track_geom["max_x_offset"]
+        min_track_y = track_geom["min_y_offset"]
+        max_track_y = track_geom["max_y_offset"]
 
         track_x_value = clamp(
             self.temp_settings.get("track_info_x_offset", 0),
