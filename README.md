@@ -88,6 +88,19 @@ Unlike traditional lyrics apps that require a dedicated window, KaraokeBird uses
 *   **[winsdk](https://pypi.org/project/winsdk/)**: To interface directly with Windows Media Controls for metadata and timeline tracking.
 *   **[syncedlyrics](https://github.com/moehuri/syncedlyrics)**: To scour the web for accurate time-synced lyrics.
 
+# 🔒 Is KaraokeBird Safe?
+
+Yes, and you don't have to take our word for it — the whole point of open source is that you can check yourself:
+
+*   **Read the code.** The entire app is ~1,000 lines across `main.py`, `settings_ui.py`, and `ui_components.py`. It's small enough to fully audit in one sitting.
+*   **No network exfiltration.** Search the source for `requests`, `socket`, or `http` — the only outbound traffic is (1) [`syncedlyrics`](https://github.com/moehuri/syncedlyrics), an open-source package that looks up lyrics text, and (2) a single `webbrowser.open()` call that opens the GitHub Releases page when you check for updates. Nothing else leaves your machine.
+*   **No accounts, no API keys, no telemetry.** Settings are saved locally to `settings.json`, and logs stay in a local rotating log file. Nothing is uploaded anywhere.
+*   **No AI/LLM involved.** KaraokeBird doesn't call any AI model or service today. If that ever changes in a future release, this section will be updated to say exactly what data would be sent and how to inspect the prompts/tool calls before you install it.
+*   **Run from source, not a prebuilt binary.** The safest way to use KaraokeBird is `pip install -r requirements.txt && python main.py` from a clone of this repo — that way you're only ever running code you (or GitHub) can read. If a packaged `.exe` is ever published, treat it like any downloaded binary: scan it with [VirusTotal](https://www.virustotal.com/) before running it.
+*   **Dependencies are all mainstream, inspectable PyPI packages**: `PyQt6`, `winsdk` (Microsoft's own Windows SDK bindings), `syncedlyrics`, `qasync`, `keyboard`. Check any of them on PyPI/GitHub yourself.
+
+If you're sharing this in a Discord server, the best answer to "is this safe?" is always "read it yourself" — link people to this section and to the source files above.
+
 # 🤝 Contributions
 
 KaraokeBird is an open-source project, and contributions are welcome!
