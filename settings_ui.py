@@ -1,6 +1,8 @@
+import copy
 import json
 import logging
 import os
+import re
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QKeySequence
@@ -17,9 +19,11 @@ from PyQt6.QtWidgets import (
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QKeySequenceEdit,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QTabWidget,
@@ -27,6 +31,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+import autostart
 from ui_components import StrokedLabel
 
 
@@ -43,9 +48,13 @@ def get_app_data_dir():
 
 
 SETTINGS_FILE = os.path.join(get_app_data_dir(), "settings.json")
+TRACK_OFFSETS_FILE = os.path.join(get_app_data_dir(), "track_offsets.json")
+LYRICS_CACHE_DIR = os.path.join(get_app_data_dir(), "lyrics_cache")
 
 OVERLAY_WIDTH = 1200
-OVERLAY_HEIGHT = 400
+OVERLAY_MIN_HEIGHT = 400
+# Layout margins plus breathing room above/below the lyric lines.
+OVERLAY_PADDING = 40
 
 
 def clamp(value, min_value, max_value):
@@ -72,7 +81,28 @@ def get_track_info_gap(font_size):
     return max(6, int(font_size * 0.5))
 
 
-def get_overlay_position_bounds(screen_geom):
+def get_line_height(font_size):
+    """Approximate pixel height of one lyric line at ``font_size`` points.
+
+    1pt is 4/3px at Qt's logical 96 DPI; a rendered line (ascent, descent and
+    leading) is about 1.5x the pixel size, plus the layout's 6px spacing.
+    """
+    return int(font_size * 4 / 3 * 1.5) + 6
+
+
+def get_overlay_height(settings):
+    """Height that fits the highlight line and every context line."""
+    num_context = settings.get("num_history_lines", 0) + settings.get(
+        "num_future_lines", 1
+    )
+    content = get_line_height(settings.get("font_size_highlight", 24))
+    content += num_context * get_line_height(settings.get("font_size_normal", 14))
+    if settings.get("translation_lang"):
+        content += get_line_height(settings.get("font_size_normal", 14))
+    return max(OVERLAY_MIN_HEIGHT, content + OVERLAY_PADDING)
+
+
+def get_overlay_position_bounds(settings, screen_geom):
     """Return offset bounds that let the lyric anchor reach every screen edge.
 
     The overlay is deliberately larger than an individual lyric line.  Positioning
@@ -81,21 +111,22 @@ def get_overlay_position_bounds(screen_geom):
     the visible lyric anchor can travel across the whole selected display even
     when the overlay itself extends beyond an edge.
     """
+    height = get_overlay_height(settings)
     return {
         "min_x_offset": -(screen_geom.width() // 2),
         "max_x_offset": screen_geom.width() // 2,
         # A negative Y offset moves the overlay down.  At the minimum, the
         # centre of the lyric overlay is exactly at the display's bottom edge.
-        "min_y_offset": -(OVERLAY_HEIGHT // 2),
-        "max_y_offset": screen_geom.height() - (OVERLAY_HEIGHT // 2),
+        "min_y_offset": -(height // 2),
+        "max_y_offset": screen_geom.height() - (height // 2),
     }
 
 
 def compute_overlay_geometry(settings, screen_geom):
     width = OVERLAY_WIDTH
-    height = OVERLAY_HEIGHT
+    height = get_overlay_height(settings)
 
-    position_bounds = get_overlay_position_bounds(screen_geom)
+    position_bounds = get_overlay_position_bounds(settings, screen_geom)
     min_y_offset = position_bounds["min_y_offset"]
     max_y_offset = position_bounds["max_y_offset"]
     y_offset = clamp(
@@ -153,6 +184,8 @@ def compute_track_info_geometry(settings, screen_geom):
         "y": base_y + y_offset,
         "width": width,
         "height": height,
+        "base_x": base_x,
+        "base_y": base_y,
         "min_x_offset": min_x_offset,
         "max_x_offset": max_x_offset,
         "min_y_offset": min_y_offset,
@@ -160,11 +193,44 @@ def compute_track_info_geometry(settings, screen_geom):
     }
 
 
+def overlay_offsets_from_pos(settings, screen_geom, x, y):
+    """Inverse of compute_overlay_geometry: the (clamped) offsets that put
+    the overlay's top-left corner at (x, y)."""
+    geom = compute_overlay_geometry(settings, screen_geom)
+    center_x = screen_geom.x() + (screen_geom.width() - geom["width"]) // 2
+    base_y = screen_geom.y() + (screen_geom.height() - geom["height"])
+    return {
+        "window_x_offset": clamp(
+            x - center_x, geom["min_x_offset"], geom["max_x_offset"]
+        ),
+        "window_y_offset": clamp(
+            base_y - y, geom["min_y_offset"], geom["max_y_offset"]
+        ),
+    }
+
+
+def track_info_offsets_from_pos(settings, screen_geom, x, y):
+    """Inverse of compute_track_info_geometry: the (clamped) offsets that put
+    the track info's top-left corner at (x, y), relative to the overlay's
+    current position in ``settings``."""
+    geom = compute_track_info_geometry(settings, screen_geom)
+    return {
+        "track_info_x_offset": clamp(
+            x - geom["base_x"], geom["min_x_offset"], geom["max_x_offset"]
+        ),
+        "track_info_y_offset": clamp(
+            y - geom["base_y"], geom["min_y_offset"], geom["max_y_offset"]
+        ),
+    }
+
+
 DEFAULT_SETTINGS = {
     "highlight_color": "#ffff00",
     "stroke_color": "#000000",
     "normal_color": "#ebebeb",
-    "background_color": "rgba(0, 0, 0, 100)",
+    "background_enabled": False,
+    "background_color": "#64000000",  # #AARRGGBB
+    "track_info_background_enabled": False,
     "font_family": "Century Gothic",
     "font_size_highlight": 24,
     "font_size_normal": 14,
@@ -183,44 +249,267 @@ DEFAULT_SETTINGS = {
     "track_info_x_offset": 0,
     "track_info_y_offset": 0,
     "track_info_hotkey": "",
+    "auto_hide_idle": True,
+    "overlay_visible": True,
+    "track_info_manually_hidden": False,
+    "word_highlight": False,
+    "translation_lang": "",
+    "offset_back_hotkey": "",
+    "offset_fwd_hotkey": "",
+    "preferred_source": "",  # SMTC app id; "" = Auto
+    "presets": {},  # name -> {appearance key: value}
+    "update_check_enabled": True,
+    "last_update_check": 0.0,  # time.time() of the last check
 }
+
+# Settings changed outside the dialog (tray, hotkeys, background checks)
+# while it may be open. The dialog keeps their current values on Save
+# instead of the ones it copied when it opened, and Restore Defaults leaves
+# them alone.
+RUNTIME_STATE_KEYS = (
+    "overlay_visible",
+    "track_info_manually_hidden",
+    "preferred_source",
+    "presets",
+    "last_update_check",
+)
+
+# What a style preset saves and restores.
+APPEARANCE_KEYS = (
+    "font_family",
+    "font_size_highlight",
+    "font_size_normal",
+    "highlight_color",
+    "normal_color",
+    "stroke_color",
+    "stroke_enabled_highlight",
+    "stroke_enabled_context",
+    "enable_animations",
+    "animation_type",
+    "background_enabled",
+    "background_color",
+    "track_info_background_enabled",
+)
+
+
+def make_preset(settings):
+    return {key: copy.deepcopy(settings[key]) for key in APPEARANCE_KEYS}
+
+
+def apply_preset(settings, preset):
+    """Copy a preset's appearance values into ``settings``, skipping unknown
+    or badly typed ones. Returns the rejected keys."""
+    rejected = []
+    if not isinstance(preset, dict):
+        return ["<preset>"]
+    for key, value in preset.items():
+        if key not in APPEARANCE_KEYS:
+            rejected.append(key)
+            continue
+        try:
+            settings[key] = _coerce_setting(value, DEFAULT_SETTINGS[key])
+        except (ValueError, OverflowError):
+            rejected.append(key)
+    if "background_color" in preset:
+        settings["background_color"] = normalize_color(
+            settings["background_color"], DEFAULT_SETTINGS["background_color"]
+        )
+    return rejected
+
+_HEX_COLOR_RE = re.compile(r"^#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$")
+_CSS_RGBA_RE = re.compile(
+    r"^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+)\s*)?\)$",
+    re.IGNORECASE,
+)
+
+
+def normalize_color(value, default):
+    """Return ``value`` as ``#RRGGBB`` / ``#AARRGGBB`` (which QColor reads).
+
+    Older settings files store CSS ``rgba(r, g, b, a)`` strings, with alpha
+    either 0-255 or a 0-1 fraction; those are converted. Anything else that
+    isn't a hex color falls back to ``default``.
+    """
+    if isinstance(value, str):
+        value = value.strip()
+        if _HEX_COLOR_RE.match(value):
+            return value.lower()
+        match = _CSS_RGBA_RE.match(value)
+        if match:
+            r, g, b = (min(255, int(c)) for c in match.groups()[:3])
+            alpha = match.group(4)
+            if alpha is None:
+                a = 255
+            elif "." in alpha:
+                a = round(min(1.0, float(alpha)) * 255)
+            else:
+                a = min(255, int(alpha))
+            return f"#{a:02x}{r:02x}{g:02x}{b:02x}"
+    return default
+
+
+def css_color(value):
+    """Convert a ``#AARRGGBB`` color to ``rgba(...)`` for Qt style sheets."""
+    if isinstance(value, str) and len(value) == 9 and value.startswith("#"):
+        a, r, g, b = (int(value[i : i + 2], 16) for i in (1, 3, 5, 7))
+        return f"rgba({r}, {g}, {b}, {a})"
+    return value
+
+
+def _coerce_setting(value, default):
+    """Return ``value`` converted to the type of ``default``, or raise
+    ValueError when the types aren't compatible.
+
+    int and float are interchangeable (converted to the default's type), but
+    bool must stay bool, since ``isinstance(True, int)`` is true.
+    """
+    if isinstance(default, bool) or isinstance(value, bool):
+        if isinstance(default, bool) and isinstance(value, bool):
+            return value
+        raise ValueError
+    if isinstance(default, (int, float)) and isinstance(value, (int, float)):
+        return type(default)(round(value) if isinstance(default, int) else value)
+    if isinstance(value, type(default)):
+        return value
+    raise ValueError
+
+
+def validate_settings(data, defaults):
+    """Merge ``data`` over ``defaults``, keeping only well-typed known keys.
+
+    Returns ``(settings, rejected_keys)``.
+    """
+    settings = copy.deepcopy(defaults)
+    rejected = []
+    if not isinstance(data, dict):
+        return settings, ["<root>"]
+    for key, value in data.items():
+        if key not in defaults:
+            rejected.append(key)
+            continue
+        try:
+            settings[key] = _coerce_setting(value, defaults[key])
+        except (ValueError, OverflowError):
+            rejected.append(key)
+    return settings, rejected
 
 
 class SettingsManager:
     def __init__(self):
-        self.settings = DEFAULT_SETTINGS.copy()
+        self.settings = copy.deepcopy(DEFAULT_SETTINGS)
         self.load()
 
     def load(self):
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE, "r") as f:
-                    data = json.load(f)
-                    self.settings.update(data)
-            except Exception:
-                logging.exception("Error loading settings")
+        if not os.path.exists(SETTINGS_FILE):
+            return
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            logging.exception("Error loading settings")
+            return
+
+        self.settings, rejected = validate_settings(data, DEFAULT_SETTINGS)
+        for key in rejected:
+            logging.warning(f"Ignoring invalid or unknown setting: {key!r}")
+
+        # Older versions stored a CSS "rgba(...)" string, which QColor can't
+        # read.
+        self.settings["background_color"] = normalize_color(
+            self.settings["background_color"], DEFAULT_SETTINGS["background_color"]
+        )
 
     def save(self):
+        tmp_path = SETTINGS_FILE + ".tmp"
         try:
-            with open(SETTINGS_FILE, "w") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.settings, f, indent=4)
+            os.replace(tmp_path, SETTINGS_FILE)
         except Exception:
             logging.exception("Error saving settings")
-
-    def get(self, key):
-        return self.settings.get(key, DEFAULT_SETTINGS.get(key))
 
     def set(self, key, value):
         self.settings[key] = value
 
 
+# (setting key, label, help text) for each global hotkey.
+HOTKEY_FIELDS = (
+    (
+        "toggle_hotkey",
+        "Toggle Lyrics Hotkey:",
+        "Click and press a key combination (e.g., Ctrl+L) to hide/show the lyrics.",
+    ),
+    (
+        "track_info_hotkey",
+        "Toggle Track Info Hotkey:",
+        "Hide/show the song and artist independently of the lyrics.",
+    ),
+    (
+        "offset_back_hotkey",
+        "Song Offset −100 ms:",
+        "Shows this song's lyrics 100 ms later (saved per song).",
+    ),
+    (
+        "offset_fwd_hotkey",
+        "Song Offset +100 ms:",
+        "Shows this song's lyrics 100 ms earlier (saved per song).",
+    ),
+)
+
+# (code, name) for the translation combo; "" turns translations off.
+TRANSLATION_LANGUAGES = (
+    ("", "Off"),
+    ("en", "English"),
+    ("th", "Thai"),
+    ("ja", "Japanese"),
+    ("ko", "Korean"),
+    ("zh", "Chinese"),
+    ("es", "Spanish"),
+    ("fr", "French"),
+    ("de", "German"),
+    ("pt", "Portuguese"),
+    ("it", "Italian"),
+    ("ru", "Russian"),
+    ("id", "Indonesian"),
+    ("vi", "Vietnamese"),
+)
+
+PREVIEW_CONTEXT_LINES = 2
+# (previous lines, current line, upcoming lines); "Preview animation" swaps
+# between the two.
+PREVIEW_SAMPLES = (
+    (
+        ["Earlier Lyric Line", "Previous Lyric Line"],
+        "Current Active Lyric",
+        ["Upcoming Lyric Line", "Later Lyric Line"],
+    ),
+    (
+        ["Previous Lyric Line", "Current Active Lyric"],
+        "The Next Line Arrives",
+        ["Later Lyric Line", "Even Later Line"],
+    ),
+)
+
+
+def _scrollable(widget):
+    area = QScrollArea()
+    area.setWidget(widget)
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.Shape.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    return area
+
+
 class SettingsDialog(QDialog):
     settings_changed = pyqtSignal(dict)
+    clear_lyrics_cache_requested = pyqtSignal()
 
     def __init__(self, settings_manager, parent=None):
         super().__init__(parent)
         self.manager = settings_manager
-        self.temp_settings = self.manager.settings.copy()
+        self.temp_settings = copy.deepcopy(self.manager.settings)
+        # Set by the "Drag on screen…" button.
+        self.edit_position_requested = False
         self.setWindowTitle("KaraokeBird Settings")
         self.setFixedWidth(450)
 
@@ -231,25 +520,33 @@ class SettingsDialog(QDialog):
 
         # --- Preview Section (Always Visible) ---
         self.preview_frame = QFrame()
-        self.preview_frame.setStyleSheet(
-            f"background-color: {self.temp_settings.get('background_color', '#000000')}; border-radius: 8px;"
-        )
         self.preview_frame.setMinimumHeight(140)
 
         preview_layout = QVBoxLayout()
         preview_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.preview_prev = StrokedLabel("Previous Lyric Line")
-        self.preview_prev.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview_layout.addWidget(self.preview_prev)
+        # Up to PREVIEW_CONTEXT_LINES context lines on each side; update_preview
+        # shows as many as the history/upcoming counts ask for.
+        self.preview_prev_labels = []
+        for _ in range(PREVIEW_CONTEXT_LINES):
+            lbl = StrokedLabel("")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.preview_prev_labels.append(lbl)
+            preview_layout.addWidget(lbl)
 
-        self.preview_label = StrokedLabel("Current Active Lyric")
+        self.preview_label = StrokedLabel("")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         preview_layout.addWidget(self.preview_label)
 
-        self.preview_next = StrokedLabel("Upcoming Lyric Line")
-        self.preview_next.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview_layout.addWidget(self.preview_next)
+        self.preview_next_labels = []
+        for _ in range(PREVIEW_CONTEXT_LINES):
+            lbl = StrokedLabel("")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.preview_next_labels.append(lbl)
+            preview_layout.addWidget(lbl)
+
+        self._preview_sample = 0
+        self._set_preview_texts(PREVIEW_SAMPLES[0])
 
         self.preview_frame.setLayout(preview_layout)
         main_layout.addWidget(QLabel("<b>Live Preview:</b>"))
@@ -257,11 +554,12 @@ class SettingsDialog(QDialog):
         main_layout.addSpacing(10)
 
         # --- Tabbed Categories ---
+        # Each tab scrolls so the dialog fits on short (768px) screens.
         self.tabs = QTabWidget()
 
-        self.tabs.addTab(self.create_appearance_tab(), "Appearance")
-        self.tabs.addTab(self.create_layout_tab(), "Layout")
-        self.tabs.addTab(self.create_system_tab(), "System")
+        self.tabs.addTab(_scrollable(self.create_appearance_tab()), "Appearance")
+        self.tabs.addTab(_scrollable(self.create_layout_tab()), "Layout")
+        self.tabs.addTab(_scrollable(self.create_system_tab()), "System")
 
         main_layout.addWidget(self.tabs)
 
@@ -284,6 +582,29 @@ class SettingsDialog(QDialog):
     def create_appearance_tab(self):
         widget = QWidget()
         layout = QVBoxLayout()
+
+        # Style presets: named snapshots of the appearance settings, saved
+        # immediately (they're a library, not part of this edit session).
+        preset_group = QGroupBox("Style Presets")
+        preset_layout = QHBoxLayout()
+
+        self.combo_presets = QComboBox()
+        self.combo_presets.setMinimumWidth(160)
+        self._refresh_presets()
+        self.combo_presets.activated.connect(self._apply_selected_preset)
+        preset_layout.addWidget(self.combo_presets, 1)
+
+        btn_save_preset = QPushButton("Save…")
+        btn_save_preset.setToolTip("Save the current look as a preset")
+        btn_save_preset.clicked.connect(self._save_preset)
+        preset_layout.addWidget(btn_save_preset)
+
+        self.btn_delete_preset = QPushButton("Delete")
+        self.btn_delete_preset.clicked.connect(self._delete_preset)
+        preset_layout.addWidget(self.btn_delete_preset)
+
+        preset_group.setLayout(preset_layout)
+        layout.addWidget(preset_group)
 
         # Text Style Group
         font_group = QGroupBox("Typography")
@@ -367,8 +688,54 @@ class SettingsDialog(QDialog):
         )
         color_layout.addRow("Effect Style:", self.combo_anim_type)
 
+        self.btn_preview_anim = QPushButton("Preview animation")
+        self.btn_preview_anim.clicked.connect(self.preview_animation)
+        color_layout.addRow("", self.btn_preview_anim)
+
         color_group.setLayout(color_layout)
         layout.addWidget(color_group)
+
+        # Readability background
+        bg_group = QGroupBox("Background")
+        bg_layout = QFormLayout()
+
+        self.check_background = QCheckBox("Draw a background behind the lyrics")
+        self.check_background.setChecked(
+            self.temp_settings.get("background_enabled", False)
+        )
+        self.check_background.toggled.connect(
+            lambda v: self.update_setting("background_enabled", v)
+        )
+        bg_layout.addRow(self.check_background)
+
+        self.check_track_background = QCheckBox(
+            "Draw a background behind the track info"
+        )
+        self.check_track_background.setChecked(
+            self.temp_settings.get("track_info_background_enabled", False)
+        )
+        self.check_track_background.toggled.connect(
+            lambda v: self.update_setting("track_info_background_enabled", v)
+        )
+        bg_layout.addRow(self.check_track_background)
+
+        self.btn_color_bg = QPushButton("Choose...")
+        self.btn_color_bg.setFixedWidth(100)
+        self.btn_color_bg.setStyleSheet(
+            color_button_style(css_color(self.temp_settings["background_color"]))
+        )
+        self.btn_color_bg.clicked.connect(
+            lambda: self.pick_color(
+                "background_color", self.btn_color_bg, with_alpha=True
+            )
+        )
+        bg_layout.addRow("Background Color:", self.btn_color_bg)
+        bg_layout.addRow(
+            QLabel("<small>Keeps lyrics readable over bright windows.</small>")
+        )
+
+        bg_group.setLayout(bg_layout)
+        layout.addWidget(bg_group)
         layout.addStretch()
         widget.setLayout(layout)
         return widget
@@ -401,19 +768,10 @@ class SettingsDialog(QDialog):
         # Vertical Position
         y_layout = QHBoxLayout()
         self.slider_offset_y = QSlider(Qt.Orientation.Horizontal)
-        self.slider_offset_y.setValue(self.temp_settings["window_y_offset"])
-        self.slider_offset_y.valueChanged.connect(
-            lambda v: self.update_setting("window_y_offset", v)
-        )
-
         self.spin_offset_y = QSpinBox()
-        self.spin_offset_y.setValue(self.temp_settings["window_y_offset"])
-        self.spin_offset_y.valueChanged.connect(
-            lambda v: self.update_setting("window_y_offset", v)
+        self._bind_slider_spin(
+            self.slider_offset_y, self.spin_offset_y, "window_y_offset"
         )
-
-        self.slider_offset_y.valueChanged.connect(self.spin_offset_y.setValue)
-        self.spin_offset_y.valueChanged.connect(self.slider_offset_y.setValue)
 
         y_layout.addWidget(QLabel("Screen Bottom"))
         y_layout.addWidget(self.slider_offset_y)
@@ -430,19 +788,10 @@ class SettingsDialog(QDialog):
         # Horizontal Position
         x_layout = QHBoxLayout()
         self.slider_offset_x = QSlider(Qt.Orientation.Horizontal)
-        self.slider_offset_x.setValue(self.temp_settings.get("window_x_offset", 0))
-        self.slider_offset_x.valueChanged.connect(
-            lambda v: self.update_setting("window_x_offset", v)
-        )
-
         self.spin_offset_x = QSpinBox()
-        self.spin_offset_x.setValue(self.temp_settings.get("window_x_offset", 0))
-        self.spin_offset_x.valueChanged.connect(
-            lambda v: self.update_setting("window_x_offset", v)
+        self._bind_slider_spin(
+            self.slider_offset_x, self.spin_offset_x, "window_x_offset"
         )
-
-        self.slider_offset_x.valueChanged.connect(self.spin_offset_x.setValue)
-        self.spin_offset_x.valueChanged.connect(self.slider_offset_x.setValue)
 
         x_layout.addWidget(QLabel("Screen Left"))
         x_layout.addWidget(self.slider_offset_x)
@@ -456,6 +805,14 @@ class SettingsDialog(QDialog):
                 "0 = center; the transparent overlay may extend past an edge.</small>"
             )
         )
+
+        self.btn_drag_position = QPushButton("Drag on screen…")
+        self.btn_drag_position.setToolTip(
+            "Save these settings, close this window and drag the lyrics and "
+            "track info into place."
+        )
+        self.btn_drag_position.clicked.connect(self.request_edit_position)
+        pos_layout.addWidget(self.btn_drag_position)
 
         pos_group.setLayout(pos_layout)
         layout.addWidget(pos_group)
@@ -508,19 +865,10 @@ class SettingsDialog(QDialog):
 
         track_x_layout = QHBoxLayout()
         self.slider_track_x = QSlider(Qt.Orientation.Horizontal)
-        self.slider_track_x.setValue(self.temp_settings.get("track_info_x_offset", 0))
-        self.slider_track_x.valueChanged.connect(
-            lambda v: self.update_setting("track_info_x_offset", v)
-        )
-
         self.spin_track_x = QSpinBox()
-        self.spin_track_x.setValue(self.temp_settings.get("track_info_x_offset", 0))
-        self.spin_track_x.valueChanged.connect(
-            lambda v: self.update_setting("track_info_x_offset", v)
+        self._bind_slider_spin(
+            self.slider_track_x, self.spin_track_x, "track_info_x_offset"
         )
-
-        self.slider_track_x.valueChanged.connect(self.spin_track_x.setValue)
-        self.spin_track_x.valueChanged.connect(self.slider_track_x.setValue)
 
         track_x_layout.addWidget(QLabel("Left"))
         track_x_layout.addWidget(self.slider_track_x)
@@ -530,23 +878,17 @@ class SettingsDialog(QDialog):
 
         track_y_layout = QHBoxLayout()
         self.slider_track_y = QSlider(Qt.Orientation.Horizontal)
-        self.slider_track_y.setValue(self.temp_settings.get("track_info_y_offset", 0))
-        self.slider_track_y.valueChanged.connect(
-            lambda v: self.update_setting("track_info_y_offset", v)
-        )
-
         self.spin_track_y = QSpinBox()
-        self.spin_track_y.setValue(self.temp_settings.get("track_info_y_offset", 0))
-        self.spin_track_y.valueChanged.connect(
-            lambda v: self.update_setting("track_info_y_offset", v)
+        self._bind_slider_spin(
+            self.slider_track_y, self.spin_track_y, "track_info_y_offset"
         )
 
-        self.slider_track_y.valueChanged.connect(self.spin_track_y.setValue)
-        self.spin_track_y.valueChanged.connect(self.slider_track_y.setValue)
-
-        track_y_layout.addWidget(QLabel("Top"))
+        # Stored offsets grow downward; flip only the slider's appearance so
+        # it reads "down <- -> up" like the lyrics slider.
+        self.slider_track_y.setInvertedAppearance(True)
+        track_y_layout.addWidget(QLabel("Down"))
         track_y_layout.addWidget(self.slider_track_y)
-        track_y_layout.addWidget(QLabel("Bottom"))
+        track_y_layout.addWidget(QLabel("Up"))
         track_y_layout.addWidget(self.spin_track_y)
         track_layout.addLayout(track_y_layout)
 
@@ -609,39 +951,102 @@ class SettingsDialog(QDialog):
         sync_group.setLayout(sync_layout)
         layout.addWidget(sync_group)
 
+        # Behavior Group
+        behavior_group = QGroupBox("Behavior")
+        behavior_layout = QVBoxLayout()
+
+        self.check_auto_hide = QCheckBox("Fade out when nothing is playing")
+        self.check_auto_hide.setChecked(self.temp_settings.get("auto_hide_idle", True))
+        self.check_auto_hide.toggled.connect(
+            lambda v: self.update_setting("auto_hide_idle", v)
+        )
+        behavior_layout.addWidget(self.check_auto_hide)
+        behavior_layout.addWidget(
+            QLabel(
+                "<small>Hides the overlay and track info 5 seconds after playback "
+                "pauses or stops, and brings them back when it resumes.</small>"
+            )
+        )
+
+        # Reflects the registry, not settings.json; applied on Save.
+        self.check_autostart = QCheckBox("Start with Windows")
+        self.check_autostart.setChecked(autostart.is_enabled())
+        behavior_layout.addWidget(self.check_autostart)
+
+        self.check_update_check = QCheckBox("Check for updates once a day")
+        self.check_update_check.setChecked(
+            self.temp_settings.get("update_check_enabled", True)
+        )
+        self.check_update_check.toggled.connect(
+            lambda v: self.update_setting("update_check_enabled", v)
+        )
+        behavior_layout.addWidget(self.check_update_check)
+        behavior_layout.addWidget(
+            QLabel(
+                "<small>Asks GitHub for the latest release number. Nothing about "
+                "you or your music is sent.</small>"
+            )
+        )
+
+        behavior_group.setLayout(behavior_layout)
+        layout.addWidget(behavior_group)
+
+        # Lyrics Group
+        lyrics_group = QGroupBox("Lyrics")
+        lyrics_layout = QFormLayout()
+
+        self.check_word_highlight = QCheckBox("Highlight word by word")
+        self.check_word_highlight.setChecked(
+            self.temp_settings.get("word_highlight", False)
+        )
+        self.check_word_highlight.toggled.connect(
+            lambda v: self.update_setting("word_highlight", v)
+        )
+        lyrics_layout.addRow(self.check_word_highlight)
+        lyrics_layout.addRow(
+            QLabel(
+                "<small>When word timing is available (Musixmatch); otherwise "
+                "whole lines are highlighted.</small>"
+            )
+        )
+
+        self.combo_translation = QComboBox()
+        for code, name in TRANSLATION_LANGUAGES:
+            self.combo_translation.addItem(name, code)
+        index = self.combo_translation.findData(
+            self.temp_settings.get("translation_lang", "")
+        )
+        self.combo_translation.setCurrentIndex(max(0, index))
+        self.combo_translation.currentIndexChanged.connect(
+            lambda _: self.update_setting(
+                "translation_lang", self.combo_translation.currentData()
+            )
+        )
+        lyrics_layout.addRow("Translation:", self.combo_translation)
+        lyrics_layout.addRow(
+            QLabel(
+                "<small>Shows a translated line under the current one when "
+                "Musixmatch has a translation.</small>"
+            )
+        )
+
+        self.btn_clear_cache = QPushButton("Clear lyrics cache")
+        self.btn_clear_cache.clicked.connect(self._clear_lyrics_cache)
+        lyrics_layout.addRow(self.btn_clear_cache)
+
+        lyrics_group.setLayout(lyrics_layout)
+        layout.addWidget(lyrics_group)
+
         # Controls Group
         ctrl_group = QGroupBox("Controls")
         ctrl_layout = QFormLayout()
 
-        self.hotkey_edit = QKeySequenceEdit()
-        current_hotkey = self.temp_settings.get("toggle_hotkey", "")
-        if current_hotkey:
-            self.hotkey_edit.setKeySequence(QKeySequence(current_hotkey))
-        self.hotkey_edit.keySequenceChanged.connect(
-            lambda seq: self.update_hotkey("toggle_hotkey", seq)
-        )
-
-        ctrl_layout.addRow("Toggle Lyrics Hotkey:", self.hotkey_edit)
-        ctrl_layout.addRow(
-            QLabel(
-                "<small>Click and press a key combination (e.g., Ctrl+L) to hide/show the lyrics.</small>"
-            )
-        )
-
-        self.track_hotkey_edit = QKeySequenceEdit()
-        current_track_hotkey = self.temp_settings.get("track_info_hotkey", "")
-        if current_track_hotkey:
-            self.track_hotkey_edit.setKeySequence(QKeySequence(current_track_hotkey))
-        self.track_hotkey_edit.keySequenceChanged.connect(
-            lambda seq: self.update_hotkey("track_info_hotkey", seq)
-        )
-
-        ctrl_layout.addRow("Toggle Track Info Hotkey:", self.track_hotkey_edit)
-        ctrl_layout.addRow(
-            QLabel(
-                "<small>Hide/show the song and artist independently of the lyrics.</small>"
-            )
-        )
+        # setting key -> QKeySequenceEdit
+        self.hotkey_edits = {}
+        for key, label, help_text in HOTKEY_FIELDS:
+            edit = self._make_hotkey_edit(key)
+            ctrl_layout.addRow(label, edit)
+            ctrl_layout.addRow(QLabel(f"<small>{help_text}</small>"))
 
         self.hotkey_warning_label = QLabel("")
         self.hotkey_warning_label.setStyleSheet("color: #ff5555;")
@@ -666,25 +1071,31 @@ class SettingsDialog(QDialog):
         num_history = self.temp_settings.get("num_history_lines", 0)
         num_future = self.temp_settings.get("num_future_lines", 1)
 
-        # Update History Preview
-        self.preview_prev.setFont(context_font)
-        self.preview_prev.setStyleSheet(f"color: {context_color};")
-        self.preview_prev.setStrokeColor(stroke_color)
-        self.preview_prev.setStrokeEnabled(
-            self.temp_settings.get("stroke_enabled_context", True)
+        # The frame stands in for the desktop; with the readability
+        # background on, it shows that color instead.
+        if self.temp_settings.get("background_enabled", False):
+            frame_color = css_color(self.temp_settings["background_color"])
+        else:
+            frame_color = "rgba(0, 0, 0, 100)"
+        self.preview_frame.setStyleSheet(
+            f"QFrame {{ background-color: {frame_color}; border-radius: 8px; }}"
         )
-        self.preview_prev.animation_type = anim_type
-        self.preview_prev.setVisible(num_history > 0)
 
-        # Update Future Preview
-        self.preview_next.setFont(context_font)
-        self.preview_next.setStyleSheet(f"color: {context_color};")
-        self.preview_next.setStrokeColor(stroke_color)
-        self.preview_next.setStrokeEnabled(
-            self.temp_settings.get("stroke_enabled_context", True)
-        )
-        self.preview_next.animation_type = anim_type
-        self.preview_next.setVisible(num_future > 0)
+        # Context previews: show the lines closest to the current one, up to
+        # the configured counts.
+        num_slots = len(self.preview_prev_labels)
+        for i, lbl in enumerate(self.preview_prev_labels):
+            lbl.setVisible(i >= num_slots - num_history)
+        for i, lbl in enumerate(self.preview_next_labels):
+            lbl.setVisible(i < num_future)
+        for lbl in self.preview_prev_labels + self.preview_next_labels:
+            lbl.setFont(context_font)
+            lbl.setStyleSheet(f"color: {context_color};")
+            lbl.setStrokeColor(stroke_color)
+            lbl.setStrokeEnabled(
+                self.temp_settings.get("stroke_enabled_context", True)
+            )
+            lbl.animation_type = anim_type
 
         # Update Highlight Preview
         font = QFont(
@@ -702,9 +1113,28 @@ class SettingsDialog(QDialog):
         )
         self.preview_label.animation_type = anim_type
 
+    def _bind_slider_spin(self, slider, spin, key):
+        """Keep a slider and spinbox in step. Only the spinbox writes the
+        setting; the slider just drives it. Ranges and initial values are
+        set (with signals blocked) by update_position_bounds."""
+        slider.valueChanged.connect(spin.setValue)
+        spin.valueChanged.connect(slider.setValue)
+        spin.valueChanged.connect(lambda v: self.update_setting(key, v))
+
     def update_setting(self, key, value):
         self.temp_settings[key] = value
         self.update_preview()
+
+    def _make_hotkey_edit(self, key):
+        edit = QKeySequenceEdit()
+        edit.setClearButtonEnabled(True)
+        edit.setMaximumSequenceLength(1)
+        current = self.temp_settings.get(key, "")
+        if current:
+            edit.setKeySequence(QKeySequence(current))
+        edit.keySequenceChanged.connect(lambda seq: self.update_hotkey(key, seq))
+        self.hotkey_edits[key] = edit
+        return edit
 
     def update_hotkey(self, key, sequence):
         hotkey_str = sequence.toString(QKeySequence.SequenceFormat.PortableText)
@@ -712,34 +1142,155 @@ class SettingsDialog(QDialog):
         self.check_hotkey_conflict()
 
     def check_hotkey_conflict(self):
-        toggle_hotkey = self.temp_settings.get("toggle_hotkey", "")
-        track_hotkey = self.temp_settings.get("track_info_hotkey", "")
-        if toggle_hotkey and toggle_hotkey == track_hotkey:
+        seen = {}
+        duplicates = []
+        for key, label, _ in HOTKEY_FIELDS:
+            hotkey = self.temp_settings.get(key, "")
+            if not hotkey:
+                continue
+            if hotkey in seen:
+                duplicates.append(f"{seen[hotkey]} / {label.rstrip(':')}")
+            else:
+                seen[hotkey] = label.rstrip(":")
+        if duplicates:
             self.hotkey_warning_label.setText(
-                "<small>Both hotkeys are set to the same combination — only "
-                "one action will trigger.</small>"
+                "<small>Same combination used for "
+                + "; ".join(duplicates)
+                + " — both actions will trigger.</small>"
             )
         else:
             self.hotkey_warning_label.setText("")
+
+    def _clear_lyrics_cache(self):
+        self.clear_lyrics_cache_requested.emit()
+        self.btn_clear_cache.setText("Lyrics cache cleared")
+        self.btn_clear_cache.setEnabled(False)
 
     def update_font(self, font):
         self.temp_settings["font_family"] = font.family()
         self.update_preview()
 
-    def pick_color(self, key, button):
+    def pick_color(self, key, button, with_alpha=False):
+        options = QColorDialog.ColorDialogOption(0)
+        if with_alpha:
+            options = QColorDialog.ColorDialogOption.ShowAlphaChannel
         color = QColorDialog.getColor(
-            QColor(self.temp_settings[key]), self, "Select Color"
+            QColor(self.temp_settings[key]), self, "Select Color", options
         )
         if color.isValid():
-            hex_color = color.name()
+            if with_alpha:
+                hex_color = color.name(QColor.NameFormat.HexArgb)
+            else:
+                hex_color = color.name()
             self.temp_settings[key] = hex_color
-            button.setStyleSheet(color_button_style(hex_color))
+            button.setStyleSheet(color_button_style(css_color(hex_color)))
             self.update_preview()
 
-    def reset_defaults(self):
-        self.temp_settings = DEFAULT_SETTINGS.copy()
+    def _set_preview_texts(self, sample):
+        prev_texts, current, next_texts = sample
+        for lbl, text in zip(self.preview_prev_labels, prev_texts):
+            lbl.setText(text)
+        self.preview_label.setText(current)
+        for lbl, text in zip(self.preview_next_labels, next_texts):
+            lbl.setText(text)
 
-        # Appearance
+    def preview_animation(self):
+        """Run the selected transition on the preview labels."""
+        anim_type = self.temp_settings.get("animation_type", "fade")
+        for lbl in self._preview_labels():
+            lbl.enable_animation = True
+            lbl.animation_type = anim_type
+        self._preview_sample = 1 - self._preview_sample
+        self._set_preview_texts(PREVIEW_SAMPLES[self._preview_sample])
+
+    def _preview_labels(self):
+        return self.preview_prev_labels + [self.preview_label] + self.preview_next_labels
+
+    def reset_defaults(self):
+        runtime_state = {key: self.temp_settings[key] for key in RUNTIME_STATE_KEYS}
+        self.temp_settings = copy.deepcopy(DEFAULT_SETTINGS)
+        self.temp_settings.update(runtime_state)
+
+        self._load_appearance_widgets()
+
+        # Layout
+        self.spin_history.setValue(self.temp_settings.get("num_history_lines", 1))
+        self.spin_future.setValue(self.temp_settings.get("num_future_lines", 1))
+        if 0 <= self.temp_settings.get("screen_index", 0) < self.screen_combo.count():
+            self.screen_combo.setCurrentIndex(self.temp_settings.get("screen_index", 0))
+        self.slider_offset_y.setValue(self.temp_settings["window_y_offset"])
+        self.slider_offset_x.setValue(self.temp_settings.get("window_x_offset", 0))
+        self.check_track_info.setChecked(
+            self.temp_settings.get("track_info_enabled", False)
+        )
+        self.slider_track_x.setValue(self.temp_settings.get("track_info_x_offset", 0))
+        self.slider_track_y.setValue(self.temp_settings.get("track_info_y_offset", 0))
+
+        self.update_position_bounds()
+
+        # System
+        self.spin_sync.setValue(self.temp_settings.get("sync_offset_ms", 0) / 1000.0)
+        self.check_auto_hide.setChecked(self.temp_settings["auto_hide_idle"])
+        self.check_word_highlight.setChecked(self.temp_settings["word_highlight"])
+        self.combo_translation.setCurrentIndex(
+            max(0, self.combo_translation.findData(self.temp_settings["translation_lang"]))
+        )
+        self.check_update_check.setChecked(self.temp_settings["update_check_enabled"])
+        for key, edit in self.hotkey_edits.items():
+            edit.setKeySequence(QKeySequence(self.temp_settings.get(key, "")))
+        self.check_hotkey_conflict()
+
+        self.update_preview()
+
+    # --- Style presets ---
+
+    def _refresh_presets(self, select=None):
+        self.combo_presets.clear()
+        self.combo_presets.addItem("Choose a preset…", None)
+        for name in sorted(self.temp_settings["presets"], key=str.lower):
+            self.combo_presets.addItem(name, name)
+        index = self.combo_presets.findData(select) if select else 0
+        self.combo_presets.setCurrentIndex(max(0, index))
+
+    def _store_presets(self, presets):
+        """Presets are saved right away, not on the dialog's Save."""
+        self.temp_settings["presets"] = presets
+        self.manager.set("presets", copy.deepcopy(presets))
+        self.manager.save()
+
+    def _apply_selected_preset(self, index):
+        name = self.combo_presets.itemData(index)
+        if not name:
+            return
+        rejected = apply_preset(self.temp_settings, self.temp_settings["presets"][name])
+        for key in rejected:
+            logging.warning(f"Preset {name!r}: ignoring invalid value for {key!r}")
+        self._load_appearance_widgets()
+        self.update_preview()
+
+    def _save_preset(self):
+        current = self.combo_presets.currentData() or ""
+        name, ok = QInputDialog.getText(self, "Save Preset", "Preset name:", text=current)
+        name = name.strip()
+        if not ok or not name:
+            return
+        presets = dict(self.temp_settings["presets"])
+        presets[name] = make_preset(self.temp_settings)
+        self._store_presets(presets)
+        self._refresh_presets(select=name)
+
+    def _delete_preset(self):
+        name = self.combo_presets.currentData()
+        if not name:
+            return
+        presets = dict(self.temp_settings["presets"])
+        presets.pop(name, None)
+        self._store_presets(presets)
+        self._refresh_presets()
+
+    def _load_appearance_widgets(self):
+        """Show temp_settings' appearance values (APPEARANCE_KEYS) in the
+        widgets."""
         self.font_combo.setCurrentFont(QFont(self.temp_settings["font_family"]))
         self.spin_size_high.setValue(self.temp_settings["font_size_highlight"])
         self.spin_size_norm.setValue(self.temp_settings["font_size_normal"])
@@ -756,37 +1307,19 @@ class SettingsDialog(QDialog):
         self.combo_anim_type.setCurrentText(
             self.temp_settings.get("animation_type", "fade")
         )
-
-        # Layout
-        self.spin_history.setValue(self.temp_settings.get("num_history_lines", 1))
-        self.spin_future.setValue(self.temp_settings.get("num_future_lines", 1))
+        self.check_background.setChecked(self.temp_settings["background_enabled"])
+        self.check_track_background.setChecked(
+            self.temp_settings["track_info_background_enabled"]
+        )
+        self.btn_color_bg.setStyleSheet(
+            color_button_style(css_color(self.temp_settings["background_color"]))
+        )
         self.check_stroke_high.setChecked(
             self.temp_settings.get("stroke_enabled_highlight", True)
         )
         self.check_stroke_context.setChecked(
             self.temp_settings.get("stroke_enabled_context", True)
         )
-        if 0 <= self.temp_settings.get("screen_index", 0) < self.screen_combo.count():
-            self.screen_combo.setCurrentIndex(self.temp_settings.get("screen_index", 0))
-        self.slider_offset_y.setValue(self.temp_settings["window_y_offset"])
-        self.slider_offset_x.setValue(self.temp_settings.get("window_x_offset", 0))
-        self.check_track_info.setChecked(
-            self.temp_settings.get("track_info_enabled", False)
-        )
-        self.slider_track_x.setValue(self.temp_settings.get("track_info_x_offset", 0))
-        self.slider_track_y.setValue(self.temp_settings.get("track_info_y_offset", 0))
-
-        self.update_position_bounds()
-
-        # System
-        self.spin_sync.setValue(self.temp_settings.get("sync_offset_ms", 0) / 1000.0)
-        hotkey = self.temp_settings.get("toggle_hotkey", "")
-        self.hotkey_edit.setKeySequence(QKeySequence(hotkey))
-        track_hotkey = self.temp_settings.get("track_info_hotkey", "")
-        self.track_hotkey_edit.setKeySequence(QKeySequence(track_hotkey))
-        self.check_hotkey_conflict()
-
-        self.update_preview()
 
     def get_selected_screen_geometry(self):
         screens = QApplication.screens()
@@ -797,7 +1330,7 @@ class SettingsDialog(QDialog):
 
     def update_screen_selection(self, index):
         self.temp_settings["screen_index"] = index
-        self.update_position_bounds()
+        self.update_preview()
 
     def update_position_bounds(self):
         if not hasattr(self, "slider_offset_y"):
@@ -880,8 +1413,21 @@ class SettingsDialog(QDialog):
         self.temp_settings["track_info_x_offset"] = track_x_value
         self.temp_settings["track_info_y_offset"] = track_y_value
 
+    def request_edit_position(self):
+        """Save and close; the caller then enters drag-to-position mode."""
+        self.edit_position_requested = True
+        self.accept()
+
     def accept(self):
+        # Keep state that the tray/hotkeys may have changed while the dialog
+        # was open.
+        for key in RUNTIME_STATE_KEYS:
+            if key in self.manager.settings:
+                self.temp_settings[key] = self.manager.settings[key]
         self.manager.settings = self.temp_settings
+
+        if self.check_autostart.isChecked() != autostart.is_enabled():
+            autostart.set_enabled(self.check_autostart.isChecked())
         self.manager.save()
         self.settings_changed.emit(self.manager.settings)
         super().accept()

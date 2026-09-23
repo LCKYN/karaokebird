@@ -30,9 +30,19 @@ KaraokeBird is designed to be seamless and unobtrusive.
 
 🎨 **Fully Customizable**:
 *   **Typography**: Custom fonts, stroke weights, and highlight colors.
-*   **Layout**: Drag a slider to move the lyrics to the top, bottom, or middle of your screen.
-*   **Animations**: Enable gentle cross-fades for a smoother visual experience.
+*   **Layout**: Drag the lyrics and track info straight into place on screen (tray → **Edit Position**), or fine-tune them with sliders.
+*   **Animations**: Enable gentle fade, slide, or zoom transitions.
 *   **Context Lines**: Choose to see previous/next lines or keep it minimal with just the current line.
+*   **Readability Background**: An optional translucent box behind the text for bright windows.
+*   **Style Presets**: Save a look (fonts, colors, stroke, animation, background) and switch back to it later.
+
+🎶 **Lyrics Extras** (opt-in):
+*   **Word-by-word highlighting** when the lyrics provider has word timing.
+*   **Translation line** under the current lyric, in the language you choose.
+*   **Per-song sync offset**, remembered for each song, on top of the global offset.
+*   **Wrong lyrics? Search again** tries the next lyrics provider.
+
+😴 **Stays Out of the Way**: Fades out 5 seconds after playback pauses or stops, and comes back when the music does.
 
 ⚡ **Instant Setup**: No logins, no API keys, and no complex configuration required. Just run and sing.
 
@@ -77,8 +87,30 @@ See it in action: [Watch the demo on X / Twitter](https://twitter.com/joshshiman
 
 Look for the **KaraokeBird icon** (green square or bird logo) in your system tray (near the clock).
 
-*   **Right-click** the icon and select **Settings...** to open the configuration menu.
-*   **Sync Offset**: If lyrics are appearing too early or too late, adjust the offset slider in settings to fix the timing.
+*   **Left-click** the icon to show or hide the lyrics. The tooltip shows the current song.
+*   **Right-click** it for the menu:
+    *   **Edit Position**: makes the lyrics and track info draggable. Drag them anywhere (including onto another monitor), then press **Enter**/**Esc** or click **Done**. Settings → Layout → **Drag on screen…** does the same.
+    *   **Sync offset**: if lyrics appear too early or too late, nudge them by 100 ms, either for **all songs** or just **this song** (remembered per song). The same global offset is in Settings → System.
+    *   **Wrong lyrics? Search again**: tries the next lyrics provider (Lrclib, Musixmatch, NetEase, Megalobiz) and remembers the new result.
+    *   **Source**: which player to follow. **Auto** follows whatever is playing (so a YouTube tab wins over a paused Spotify); pick an app to stick to it while it's open.
+    *   **Settings...**: the full configuration window.
+*   KaraokeBird remembers whether the overlay and track info were shown, and only one copy runs at a time.
+
+### Settings
+
+*   **Appearance**: fonts, colors, stroke, transitions (**Preview animation** plays the selected one), the readability background and its color/opacity, and **Style Presets** (Save…/Delete; presets are saved immediately).
+*   **Layout**: display, position, number of previous/upcoming lines, track info position.
+*   **System**:
+    *   Global sync offset.
+    *   **Fade out when nothing is playing** (on by default).
+    *   **Start with Windows**: adds or removes a `KaraokeBird` entry under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+    *   **Check for updates once a day** (on by default).
+    *   **Lyrics**: **Highlight word by word**, **Translation** language, and **Clear lyrics cache**.
+    *   **Hotkeys** for showing/hiding the lyrics and the track info, and for nudging this song's offset by ±100 ms.
+
+Word-by-word timing and translations come only from Musixmatch, which is not always reachable. When they aren't available, KaraokeBird falls back to line-by-line lyrics with no translation.
+
+All settings live in `%APPDATA%\KaraokeBird\settings.json`.
 
 # 🛠️ How it Works
 
@@ -92,9 +124,21 @@ Unlike traditional lyrics apps that require a dedicated window, KaraokeBird uses
 
 Yes, and you don't have to take our word for it — the whole point of open source is that you can check yourself:
 
-*   **Read the code.** The entire app is ~1,000 lines across `main.py`, `settings_ui.py`, and `ui_components.py`. It's small enough to fully audit in one sitting.
-*   **No network exfiltration.** Search the source for `requests`, `socket`, or `http` — the only outbound traffic is (1) [`syncedlyrics`](https://github.com/moehuri/syncedlyrics), an open-source package that looks up lyrics text, and (2) a single `webbrowser.open()` call that opens the GitHub Releases page when you check for updates. Nothing else leaves your machine.
-*   **No accounts, no API keys, no telemetry.** Settings are saved locally to `settings.json`, and logs stay in a local rotating log file. Nothing is uploaded anywhere.
+*   **Read the code.** The entire app is about 4,000 lines across `main.py`, `settings_ui.py`, `ui_components.py`, `lyrics.py`, `storage.py`, `updates.py`, and `autostart.py`. You can audit all of it in an afternoon.
+*   **No network exfiltration.** Search the source for `requests`, `socket`, `urllib`, or `http`. The only outbound traffic is:
+    1.  [`syncedlyrics`](https://github.com/moehuri/syncedlyrics), an open-source package that looks up lyrics text. It sends the song title and artist as the search term.
+    2.  **The daily update check** (`updates.py`): at most once a day, an anonymous `GET https://api.github.com/repos/joshshiman/karaokebird/releases/latest` that reads the latest version number. Nothing about you or your music is sent. Turn it off in Settings → System → **Check for updates once a day**.
+    3.  `webbrowser.open()` calls that open the GitHub Releases page when *you* click **Check for Updates...** or **Update available**.
+
+    Nothing else leaves your machine.
+*   **No accounts, no API keys, no telemetry.** Everything stays local, in `%APPDATA%\KaraokeBird\`:
+    *   `settings.json`: your settings and style presets.
+    *   `track_offsets.json`: per-song sync offsets.
+    *   `lyrics_cache\`: one file per song with the lyrics already found. Songs you've played before load without network access. "Not found" results expire after 7 days. Settings → System → **Clear lyrics cache** deletes the folder.
+    *   `karaokebird.log`: a rotating log file.
+
+    Nothing is uploaded anywhere.
+*   **Start with Windows** only writes the single `KaraokeBird` value under your user's `Run` registry key, and only when you tick the box; unticking removes it.
 *   **No AI/LLM involved.** KaraokeBird doesn't call any AI model or service today. If that ever changes in a future release, this section will be updated to say exactly what data would be sent and how to inspect the prompts/tool calls before you install it.
 *   **Run from source, not a prebuilt binary.** The safest way to use KaraokeBird is `pip install -r requirements.txt && python main.py` from a clone of this repo — that way you're only ever running code you (or GitHub) can read. If a packaged `.exe` is ever published, treat it like any downloaded binary: scan it with [VirusTotal](https://www.virustotal.com/) before running it.
 *   **Dependencies are all mainstream, inspectable PyPI packages**: `PyQt6`, `winsdk` (Microsoft's own Windows SDK bindings), `syncedlyrics`, `qasync`, `keyboard`. Check any of them on PyPI/GitHub yourself.
@@ -107,9 +151,10 @@ KaraokeBird is an open-source project, and contributions are welcome!
 
 1.  Fork the repository.
 2.  Create your feature branch (`git checkout -b feature/AmazingFeature`).
-3.  Commit your changes (`git commit -m 'Add some AmazingFeature'`).
-4.  Push to the branch (`git push origin feature/AmazingFeature`).
-5.  Open a Pull Request.
+3.  Run the tests (`pip install -r requirements-dev.txt`, then `pytest`). They cover the pure logic: LRC parsing, sync timing, geometry, settings validation, caches.
+4.  Commit your changes (`git commit -m 'Add some AmazingFeature'`).
+5.  Push to the branch (`git push origin feature/AmazingFeature`).
+6.  Open a Pull Request.
 
 # 📝 License
 
